@@ -8,21 +8,21 @@
   Standalone weather test for lovepup+. US-only (NWS covers 50 states + territories).
   Calls api.weather.gov directly from the browser - no backend, no API key.
 
-  Note on User-Agent: NWS wants a User-Agent identifying the app. Browsers do NOT
-  let JS set the User-Agent header (it's a forbidden header), so this page relies on
-  the browser's own User-Agent, which NWS accepts because it is non-empty. A real
-  backend integration must set an explicit app User-Agent (see nws_weather.py).
+  City search uses the free Open-Meteo Geocoding API (no key, no billing, CORS open).
+  We do NOT use Google Maps: it needs a billing account and the key would be exposed
+  in this static file. The geocoder returns lat/lon, which NWS needs.
 
-  This is a throwaway functional test, not a design prototype. Styling is Tailwind
-  via CDN. For a real UI prototype we'd build it in shadcn/ui (needs a React build,
-  so it can't be a double-clickable single file like this).
+  User-Agent note: NWS wants a User-Agent identifying the app. Browsers can't set that
+  header from JS, so this page relies on the browser's own User-Agent (NWS accepts it
+  because it is non-empty). A real backend must set an explicit app User-Agent.
+
+  This is a functional test, not a design prototype. Tailwind via CDN.
 -->
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
   :root { color-scheme: light; }
   body { background: #f4f1ea; }
   .brand { color: #453a6b; }
-  .brand-bg { background: #453a6b; }
   .accent { color: #e0556e; }
   .accent-bg { background: #e0556e; }
   .accent-bg:hover { background: #cf4460; }
@@ -35,24 +35,27 @@
   <main class="w-full max-w-md">
     <header class="mb-5">
       <h1 class="text-2xl font-bold brand">lovepup+ weather</h1>
-      <p class="text-sm text-slate-500">Live data from the US National Weather Service · US cities only</p>
+      <p class="text-sm text-slate-500">Live from the US National Weather Service · US cities · updates every 15 min</p>
     </header>
 
-    <!-- Controls -->
-    <div class="bg-white rounded-2xl card p-4 mb-4">
+    <!-- City search -->
+    <div class="bg-white rounded-2xl card p-4 mb-4 relative">
       <label for="city" class="block text-xs font-semibold uppercase tracking-wide text-slate-400 mb-1.5">City</label>
       <div class="flex gap-2">
-        <select id="city" class="flex-1 rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#e0556e]/40 focus:border-[#e0556e]"></select>
+        <input id="city" type="text" autocomplete="off" placeholder="Search a US city…"
+          class="flex-1 rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#e0556e]/40 focus:border-[#e0556e]" />
         <button id="refresh" class="accent-bg text-white rounded-xl px-4 py-2.5 text-sm font-semibold whitespace-nowrap focus:outline-none focus:ring-2 focus:ring-[#e0556e]/50 transition-colors">
           Refresh
         </button>
       </div>
+      <ul id="suggest" class="hidden absolute left-4 right-4 top-[76px] z-10 bg-white rounded-xl border border-slate-200 shadow-lg overflow-hidden"></ul>
+
+      <!-- Log lives under the selector -->
+      <div id="log" class="mt-4 pt-3 border-t border-slate-100 text-sm"></div>
     </div>
 
-    <!-- Result card -->
-    <section id="result" class="bg-white rounded-2xl card p-5 min-h-[180px]" aria-live="polite">
-      <!-- states injected here -->
-    </section>
+    <!-- Current weather card -->
+    <section id="result" class="bg-white rounded-2xl card p-5 min-h-[180px]" aria-live="polite"></section>
 
     <p class="text-[11px] text-slate-400 mt-4 leading-relaxed">
       NWS is a free, public-domain US government service with no uptime guarantee.
@@ -61,40 +64,24 @@
   </main>
 
 <script>
-const CITIES = [
-  { name: "New York, NY",     lat: 40.7128,  lon: -74.0060 },
-  { name: "Los Angeles, CA",  lat: 34.0522,  lon: -118.2437 },
-  { name: "Chicago, IL",      lat: 41.8781,  lon: -87.6298 },
-  { name: "Houston, TX",      lat: 29.7604,  lon: -95.3698 },
-  { name: "Phoenix, AZ",      lat: 33.4484,  lon: -112.0740 },
-  { name: "Philadelphia, PA", lat: 39.9526,  lon: -75.1652 },
-  { name: "San Diego, CA",    lat: 32.7157,  lon: -117.1611 },
-  { name: "Denver, CO",       lat: 39.7392,  lon: -104.9903 },
-  { name: "Seattle, WA",      lat: 47.6062,  lon: -122.3321 },
-  { name: "Miami, FL",        lat: 25.7617,  lon: -80.1918 },
-  { name: "Boston, MA",       lat: 42.3601,  lon: -71.0589 },
-  { name: "Anchorage, AK",    lat: 61.2181,  lon: -149.9003 },
-];
+// ---- state ----
+const DEFAULT = { name: "Austin, Texas", lat: 30.2672, lon: -97.7431 }; // Texas default
+let current = { ...DEFAULT };
+const gridCache = {};       // NWS grid URL per "lat,lon" (never changes)
+let sniffTimer = null;      // delayed Ginger loading line
+let pollTimer = null;       // 15-min auto-update
+let logEntries = [];        // [{ t: Date, text: string }]
+const POLL_MS = 15 * 60 * 1000;
 
-const selEl = document.getElementById("city");
+const cityEl = document.getElementById("city");
 const btnEl = document.getElementById("refresh");
+const suggestEl = document.getElementById("suggest");
 const resultEl = document.getElementById("result");
-
-// simple in-memory cache: grid URL per city never changes
-const gridCache = {};
-let sniffTimer = null; // delayed Ginger loading line (only shows if the request is slow)
-
-CITIES.forEach((c, i) => {
-  const o = document.createElement("option");
-  o.value = i; o.textContent = c.name;
-  selEl.appendChild(o);
-});
+const logEl = document.getElementById("log");
 
 function esc(s){ return String(s).replace(/[&<>]/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[m])); }
 
-// lovepup+ walk-weather line. Generic (no breed logic), gentle, non-medical -
-// comfort talk, not diagnosis. High humidity bumps one band warmer
-// (vet heat-index rule: temp°F + humidity% >= 150 = ease off outdoor exercise).
+// ---- walk-weather logic (same ranges as the ticket) ----
 function walkPhrase(t, humidity) {
   if (t == null) return "Weather unavailable";
   let band = t;
@@ -107,9 +94,6 @@ function walkPhrase(t, humidity) {
   if (t >= 21)    return "Chilly today. A shorter walk, and keep your pup snug.";
   return "Cold out — make sure your pup stays cozy, and keep it quick.";
 }
-
-// Short one-line version for the home-screen row: "Good walk weather · Bring water"
-// (temp is shown separately). Same bands as walkPhrase, terser copy.
 function walkPhraseShort(t, humidity) {
   if (t == null) return "—";
   let band = t;
@@ -127,20 +111,69 @@ function walkPhraseShort(t, humidity) {
   return tags.join(" · ");
 }
 
+// ---- city search (Open-Meteo geocoding, US only) ----
+let debounce = null;
+cityEl.addEventListener("input", () => {
+  clearTimeout(debounce);
+  const q = cityEl.value.trim();
+  if (q.length < 2) return hideSuggest();
+  debounce = setTimeout(() => searchCity(q), 250);
+});
+cityEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    const first = suggestEl.querySelector("li[data-i]");
+    if (first) first.click();
+  }
+});
+document.addEventListener("click", (e) => {
+  if (!suggestEl.contains(e.target) && e.target !== cityEl) hideSuggest();
+});
+
+async function searchCity(q) {
+  try {
+    const r = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(q)}&count=8&language=en&format=json`);
+    const d = await r.json();
+    const us = (d.results || []).filter(x => x.country_code === "US");
+    showSuggest(us);
+  } catch { hideSuggest(); }
+}
+function showSuggest(list) {
+  if (!list.length) return hideSuggest();
+  suggestEl.innerHTML = list.map((c, i) =>
+    `<li data-i="${i}" class="px-3 py-2.5 text-sm hover:bg-slate-50 cursor-pointer border-b border-slate-100 last:border-0">
+       <span class="font-medium text-slate-700">${esc(c.name)}</span>
+       <span class="text-slate-400">, ${esc(c.admin1 || "")}</span>
+     </li>`).join("");
+  Array.from(suggestEl.children).forEach((li, i) => {
+    li.addEventListener("click", () => selectCity(list[i]));
+  });
+  suggestEl.classList.remove("hidden");
+}
+function hideSuggest() { suggestEl.classList.add("hidden"); suggestEl.innerHTML = ""; }
+
+function selectCity(c) {
+  current = {
+    name: [c.name, c.admin1].filter(Boolean).join(", "),
+    lat: c.latitude, lon: c.longitude,
+  };
+  cityEl.value = current.name;
+  hideSuggest();
+  resetAndLoad(); // new city → fresh log + restart the 15-min clock
+}
+
+// ---- rendering ----
 function renderLoading() {
   resultEl.innerHTML = `
     <div class="flex items-center gap-3 text-slate-500 py-10 justify-center">
       <span class="spinner inline-block w-5 h-5 border-2 border-slate-300 border-t-[#e0556e] rounded-full"></span>
       <span id="loadingMsg" class="text-sm">Looking outside…</span>
     </div>`;
-  // Only reveal the playful Ginger line if the request is actually slow.
   clearTimeout(sniffTimer);
   sniffTimer = setTimeout(() => {
     const m = document.getElementById("loadingMsg");
     if (m) m.textContent = "Ginger's sniffing out the weather in your area…";
   }, 1500);
 }
-
 function renderError(msg) {
   clearTimeout(sniffTimer);
   resultEl.innerHTML = `
@@ -151,17 +184,14 @@ function renderError(msg) {
     </div>`;
   document.getElementById("retry").addEventListener("click", load);
 }
-
 function fmtUpdated(iso) {
   try {
     const d = new Date(iso);
     const mins = Math.round((Date.now() - d.getTime()) / 60000);
-    const rel = mins < 1 ? "just now" : mins < 60 ? `${mins} min ago`
-      : `${Math.round(mins/60)} h ago`;
+    const rel = mins < 1 ? "just now" : mins < 60 ? `${mins} min ago` : `${Math.round(mins/60)} h ago`;
     return `${d.toLocaleString([], {month:"short", day:"numeric", hour:"2-digit", minute:"2-digit"})} (${rel})`;
   } catch { return iso; }
 }
-
 function renderData(d) {
   clearTimeout(sniffTimer);
   resultEl.innerHTML = `
@@ -174,31 +204,42 @@ function renderData(d) {
         <p class="text-sm text-slate-500">${esc(d.place)}</p>
         <p class="text-5xl font-bold brand mt-1">${d.temp}<span class="text-2xl align-top">°F</span></p>
       </div>
-      <div class="text-right">
-        <p class="text-sm font-medium text-slate-700">${esc(d.short)}</p>
-      </div>
+      <p class="text-sm font-medium text-slate-700 text-right">${esc(d.short)}</p>
     </div>
-
     <p class="accent font-semibold mt-3 text-[15px]">${esc(d.phrase)}</p>
-
     <dl class="grid grid-cols-3 gap-3 mt-5 text-center">
-      <div class="bg-slate-50 rounded-xl py-2.5">
-        <dt class="text-[11px] uppercase tracking-wide text-slate-400">Humidity</dt>
-        <dd class="text-lg font-semibold text-slate-700">${d.humidity == null ? "–" : d.humidity + "%"}</dd>
-      </div>
-      <div class="bg-slate-50 rounded-xl py-2.5">
-        <dt class="text-[11px] uppercase tracking-wide text-slate-400">Wind</dt>
-        <dd class="text-lg font-semibold text-slate-700">${d.wind == null ? "–" : d.wind}<span class="text-xs"> mph</span></dd>
-      </div>
-      <div class="bg-slate-50 rounded-xl py-2.5">
-        <dt class="text-[11px] uppercase tracking-wide text-slate-400">Precip</dt>
-        <dd class="text-lg font-semibold text-slate-700">${d.precip}%</dd>
-      </div>
+      <div class="bg-slate-50 rounded-xl py-2.5"><dt class="text-[11px] uppercase tracking-wide text-slate-400">Humidity</dt><dd class="text-lg font-semibold text-slate-700">${d.humidity == null ? "–" : d.humidity + "%"}</dd></div>
+      <div class="bg-slate-50 rounded-xl py-2.5"><dt class="text-[11px] uppercase tracking-wide text-slate-400">Wind</dt><dd class="text-lg font-semibold text-slate-700">${d.wind == null ? "–" : d.wind}<span class="text-xs"> mph</span></dd></div>
+      <div class="bg-slate-50 rounded-xl py-2.5"><dt class="text-[11px] uppercase tracking-wide text-slate-400">Precip</dt><dd class="text-lg font-semibold text-slate-700">${d.precip}%</dd></div>
     </dl>
-
     <p class="text-[11px] text-slate-400 mt-4">Approximate, for your area · Updated ${esc(fmtUpdated(d.updated))}</p>`;
 }
 
+// ---- log under the selector ----
+function dateKey(d){ return `${d.toLocaleDateString("en-US",{weekday:"short"})} ${d.getDate()}`; }
+function timeFmt(d){ return d.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"}).toLowerCase().replace(" ",""); }
+
+function renderLog() {
+  if (!logEntries.length) {
+    logEl.innerHTML = `<p class="text-xs text-slate-400">Readings will appear here, one every 15 minutes.</p>`;
+    return;
+  }
+  let html = "", lastDate = "";
+  logEntries.forEach(e => {
+    const dk = dateKey(e.t);
+    if (dk !== lastDate) {
+      html += `<p class="brand font-bold text-sm mt-2 mb-1">${dk}</p>`;
+      lastDate = dk;
+    }
+    html += `<div class="flex gap-3 py-1">
+      <span class="text-slate-400 tabular-nums w-16 shrink-0">${timeFmt(e.t)}</span>
+      <span class="text-slate-700">${esc(e.text)}</span>
+    </div>`;
+  });
+  logEl.innerHTML = html;
+}
+
+// ---- NWS fetch ----
 async function nwsGet(url) {
   const r = await fetch(url, { headers: { "Accept": "application/geo+json" } });
   if (!r.ok) {
@@ -207,39 +248,54 @@ async function nwsGet(url) {
   }
   return r.json();
 }
-
 async function load() {
-  const city = CITIES[selEl.value];
+  const key = `${current.lat.toFixed(4)},${current.lon.toFixed(4)}`;
   renderLoading();
   try {
-    // Step 1: resolve grid (cached per city - never changes)
-    if (!gridCache[selEl.value]) {
-      const pt = await nwsGet(`https://api.weather.gov/points/${city.lat},${city.lon}`);
-      gridCache[selEl.value] = pt.properties.forecastHourly;
+    if (!gridCache[key]) {
+      const pt = await nwsGet(`https://api.weather.gov/points/${key}`);
+      gridCache[key] = pt.properties.forecastHourly;
     }
-    // Step 2: current conditions = first hourly period
-    const h = await nwsGet(gridCache[selEl.value]);
+    const h = await nwsGet(gridCache[key]);
     const now = h.properties.periods[0];
     const temp = now.temperatureUnit === "F" ? now.temperature : Math.round(now.temperature*9/5+32);
     const wind = parseInt(String(now.windSpeed).split(" ")[0]) || null;
     const precip = (now.probabilityOfPrecipitation && now.probabilityOfPrecipitation.value) || 0;
     const humidity = (now.relativeHumidity && now.relativeHumidity.value);
+    const shortPhrase = walkPhraseShort(temp, humidity);
+
     renderData({
-      place: city.name,
+      place: current.name,
       temp, short: now.shortForecast, wind, precip,
       humidity: humidity == null ? null : humidity,
       updated: h.properties.updateTime || h.properties.generatedAt,
       phrase: walkPhrase(temp, humidity),
-      short_phrase: walkPhraseShort(temp, humidity),
+      short_phrase: shortPhrase,
     });
+
+    // append to the timeline log
+    logEntries.push({ t: new Date(), text: `${temp}°F · ${shortPhrase}` });
+    renderLog();
   } catch (e) {
     renderError(e.message || "Network error - NWS may be down.");
   }
 }
 
-selEl.addEventListener("change", load);
+function resetAndLoad() {
+  logEntries = [];
+  renderLog();
+  clearInterval(pollTimer);
+  pollTimer = setInterval(load, POLL_MS); // auto-update every 15 min
+  load();
+}
+
+// manual refresh also logs a reading (so you don't have to wait 15 min to see it work)
 btnEl.addEventListener("click", load);
-load(); // initial
+
+// ---- init ----
+cityEl.value = current.name;
+renderLog();
+resetAndLoad();
 </script>
 </body>
 </html>
