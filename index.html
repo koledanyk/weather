@@ -8,9 +8,10 @@
   Standalone weather test for lovepup+. US-only (NWS covers 50 states + territories).
   Calls api.weather.gov directly from the browser - no backend, no API key.
 
-  City search uses the free Open-Meteo Geocoding API (no key, no billing, CORS open).
-  We do NOT use Google Maps: it needs a billing account and the key would be exposed
-  in this static file. The geocoder returns lat/lon, which NWS needs.
+  City search: Google Places Autocomplete when GOOGLE_MAPS_API_KEY is set (gives
+  proper addresses); otherwise it falls back to the free Open-Meteo geocoder (no key).
+  A Google Maps key needs a billing account, and in a static file like this the key
+  is visible in the page - restrict it by HTTP referrer + API in Google Cloud.
 
   User-Agent note: NWS wants a User-Agent identifying the app. Browsers can't set that
   header from JS, so this page relies on the browser's own User-Agent (NWS accepts it
@@ -67,6 +68,10 @@
 // ---- state ----
 const DEFAULT = { name: "Austin, Texas", lat: 30.2672, lon: -97.7431 }; // Texas default
 let current = { ...DEFAULT };
+// Paste your Google Maps key here for Google Places (proper addresses).
+// Leave empty to use the free Open-Meteo geocoder instead. The key is visible in
+// this file, so restrict it by HTTP referrer + API in Google Cloud before real use.
+const GOOGLE_MAPS_API_KEY = "";
 const gridCache = {};       // NWS grid URL per "lat,lon" (never changes)
 let sniffTimer = null;      // delayed Ginger loading line
 let pollTimer = null;       // 15-min auto-update
@@ -111,8 +116,9 @@ function walkPhraseShort(t, humidity) {
   return tags.join(" · ");
 }
 
-// ---- city search (Open-Meteo geocoding, US only) ----
+// ---- city search: free fallback geocoder (Open-Meteo), used only when no Google key ----
 let debounce = null;
+function bindFreeGeocoder() {
 cityEl.addEventListener("input", () => {
   clearTimeout(debounce);
   const q = cityEl.value.trim();
@@ -128,6 +134,7 @@ cityEl.addEventListener("keydown", (e) => {
 document.addEventListener("click", (e) => {
   if (!suggestEl.contains(e.target) && e.target !== cityEl) hideSuggest();
 });
+} // end bindFreeGeocoder
 
 async function searchCity(q) {
   try {
@@ -159,6 +166,32 @@ function selectCity(c) {
   cityEl.value = current.name;
   hideSuggest();
   resetAndLoad(); // new city → fresh log + restart the 15-min clock
+}
+
+// ---- Google Places (used when GOOGLE_MAPS_API_KEY is set; gives proper addresses) ----
+window.initGooglePlaces = function () {
+  const ac = new google.maps.places.Autocomplete(cityEl, {
+    types: ["geocode"],
+    componentRestrictions: { country: "us" }, // NWS is US-only
+    fields: ["geometry", "formatted_address", "name"],
+  });
+  ac.addListener("place_changed", () => {
+    const p = ac.getPlace();
+    if (!p.geometry) return; // typed text but no suggestion picked
+    current = {
+      name: p.formatted_address || p.name,
+      lat: p.geometry.location.lat(),
+      lon: p.geometry.location.lng(),
+    };
+    resetAndLoad();
+  });
+};
+function loadGooglePlaces() {
+  const s = document.createElement("script");
+  s.src = `https://maps.googleapis.com/maps/api/js?key=${GOOGLE_MAPS_API_KEY}&libraries=places&callback=initGooglePlaces`;
+  s.async = true;
+  s.onerror = bindFreeGeocoder; // if the key fails to load, fall back
+  document.head.appendChild(s);
 }
 
 // ---- rendering ----
@@ -295,6 +328,7 @@ btnEl.addEventListener("click", load);
 // ---- init ----
 cityEl.value = current.name;
 renderLog();
+if (GOOGLE_MAPS_API_KEY) loadGooglePlaces(); else bindFreeGeocoder();
 resetAndLoad();
 </script>
 </body>
