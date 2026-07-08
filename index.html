@@ -146,9 +146,9 @@ function walkWeather(t, humidity) {
   if (t == null) return { emoji: "", line: "Weather unavailable" };
   let band = t;
   if (t >= 70 && humidity != null && (t + humidity) >= 150) band = t + 6;
-  if (band >= 90) return { emoji: "🌡️", line: "Too hot · wait for cooler hour" };
+  if (band >= 90) return { emoji: "🌡️", line: "Very hot · shade, water, quick walk" };
   if (band >= 85) return { emoji: "☀️", line: "Hot · short walk + water" };
-  if (band >= 72) return { emoji: "💧", line: "Warm · bring water" };
+  if (band >= 75) return { emoji: "💧", line: "Warm · bring water" };
   if (t >= 50)    return { emoji: "🐾", line: "Perfect walk weather" };
   if (t >= 35)    return { emoji: "🍂", line: "Cool · nice for a stroll" };
   if (t >= 21)    return { emoji: "🧣", line: "Cold · make it quick" };
