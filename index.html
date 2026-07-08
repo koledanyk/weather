@@ -8,17 +8,16 @@
   Standalone weather test for lovepup+. US-only (NWS covers 50 states + territories).
   Calls api.weather.gov directly from the browser - no backend, no API key.
 
-  City search: Google Places Autocomplete when GOOGLE_MAPS_API_KEY is set (gives
-  proper addresses); otherwise it falls back to the free Open-Meteo geocoder (no key).
-  A Google Maps key needs a billing account, and in a static file like this the key
-  is visible in the page - restrict it by HTTP referrer + API in Google Cloud.
+  City search: Google Places Autocomplete when GOOGLE_MAPS_API_KEY is set (proper
+  addresses); otherwise the free Open-Meteo geocoder (no key). A Google Maps key needs
+  a billing account and, in a static file, is visible in the page - restrict it by
+  HTTP referrer + API in Google Cloud.
 
   Password gate: a soft, client-side gate only. The password lives in the page source,
-  so anyone technical can read or bypass it. It keeps casual visitors out, nothing more.
-  For real access control, put Cloudflare Access in front of the domain.
+  so anyone technical can read or bypass it. For real access control use Cloudflare Access.
 
-  User-Agent note: NWS wants a User-Agent identifying the app. Browsers can't set that
-  header from JS, so this page relies on the browser's own User-Agent.
+  User-Agent note: browsers can't set the User-Agent header from JS, so this relies on
+  the browser's own User-Agent (NWS accepts it). A real backend must set an app one.
 
   This is a functional test, not a design prototype. Tailwind via CDN.
 -->
@@ -52,7 +51,11 @@
   <main class="w-full max-w-md">
     <header class="mb-5">
       <h1 class="text-2xl font-bold brand">lovepup+ weather</h1>
-      <p class="text-sm text-slate-500">Live from the US National Weather Service · US cities · updates every 5 min</p>
+      <p class="text-sm text-slate-500">Live from the US National Weather Service · US cities · updates every 30 min</p>
+      <div class="flex items-center gap-1.5 text-xs text-slate-500 mt-2">
+        <span id="apidot" class="inline-block w-2 h-2 rounded-full" style="background:#cbd5e1"></span>
+        <span id="apitext">Checking NWS…</span>
+      </div>
     </header>
 
     <!-- City search -->
@@ -66,13 +69,16 @@
         </button>
       </div>
       <ul id="suggest" class="hidden absolute left-4 right-4 top-[76px] z-10 bg-white rounded-xl border border-slate-200 shadow-lg overflow-hidden"></ul>
-
-      <!-- Timeline log under the selector -->
-      <div id="log" class="mt-4 pt-3 border-t border-slate-100 text-sm max-h-72 overflow-y-auto"></div>
     </div>
 
     <!-- Current weather card -->
     <section id="result" class="bg-white rounded-2xl card p-5 min-h-[180px]" aria-live="polite"></section>
+
+    <!-- History (under the weather) -->
+    <div class="bg-white rounded-2xl card p-4 mt-4">
+      <p class="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">History</p>
+      <div id="log" class="text-sm max-h-80 overflow-y-auto"></div>
+    </div>
 
     <p class="text-[11px] text-slate-400 mt-4 leading-relaxed">
       NWS is a free, public-domain US government service with no uptime guarantee.
@@ -88,7 +94,7 @@ const DEFAULT = { name: "Austin, Texas", lat: 30.2672, lon: -97.7431 }; // Texas
 // Leave empty to use the free Open-Meteo geocoder instead. The key is visible in
 // this file, so restrict it by HTTP referrer + API in Google Cloud before real use.
 const GOOGLE_MAPS_API_KEY = "";
-const POLL_MS = 5 * 60 * 1000;             // collect a reading every 5 minutes
+const POLL_MS = 30 * 60 * 1000;            // auto-update every 30 minutes
 const LS_AUTH = "weather_auth", LS_CITY = "weather_city", LS_LOG = "weather_log";
 
 // ---- state ----
@@ -96,12 +102,14 @@ let current = { ...DEFAULT };
 const gridCache = {};
 let sniffTimer = null;
 let pollTimer = null;
-let logEntries = [];                       // [{ t: Date, text }]
+let logEntries = [];                       // [{ t: Date, text, place }]
 
 const gateEl = document.getElementById("gate");
 const pwEl = document.getElementById("pw");
 const pwBtn = document.getElementById("pwbtn");
 const pwErr = document.getElementById("pwerr");
+const apiDot = document.getElementById("apidot");
+const apiText = document.getElementById("apitext");
 const cityEl = document.getElementById("city");
 const btnEl = document.getElementById("refresh");
 const suggestEl = document.getElementById("suggest");
@@ -110,11 +118,16 @@ const logEl = document.getElementById("log");
 
 function esc(s){ return String(s).replace(/[&<>]/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[m])); }
 
-// ---- localStorage persistence (data collection is continuous + survives reloads) ----
+function setApi(ok){
+  apiDot.style.background = ok ? "#22c55e" : "#e0556e";   // green live / red down
+  apiText.textContent = ok ? "NWS live" : "NWS unreachable";
+}
+
+// ---- localStorage persistence (continuous, survives reloads) ----
 function saveCity(){ try { localStorage.setItem(LS_CITY, JSON.stringify(current)); } catch {} }
 function saveLog(){
   try {
-    const slim = logEntries.slice(-200).map(e => ({ t: e.t.toISOString(), text: e.text }));
+    const slim = logEntries.slice(-200).map(e => ({ t: e.t.toISOString(), text: e.text, place: e.place }));
     localStorage.setItem(LS_LOG, JSON.stringify(slim));
   } catch {}
 }
@@ -123,38 +136,23 @@ function loadPersisted(){
     const c = JSON.parse(localStorage.getItem(LS_CITY) || "null");
     if (c && c.lat != null) current = c;
     const l = JSON.parse(localStorage.getItem(LS_LOG) || "[]");
-    logEntries = l.map(e => ({ t: new Date(e.t), text: e.text }));
+    logEntries = l.map(e => ({ t: new Date(e.t), text: e.text, place: e.place }));
   } catch {}
 }
 
-// ---- walk-weather logic (same ranges as the ticket) ----
-function walkPhrase(t, humidity) {
-  if (t == null) return "Weather unavailable";
+// ---- walk-weather logic: emoji + line per band (see the ticket table) ----
+// High humidity bumps one band warmer (heat-index rule: temp°F + humidity% >= 150).
+function walkWeather(t, humidity) {
+  if (t == null) return { emoji: "", line: "Weather unavailable" };
   let band = t;
   if (t >= 70 && humidity != null && (t + humidity) >= 150) band = t + 6;
-  if (band >= 90) return "Real hot right now — maybe wait for a cooler hour, grass over pavement.";
-  if (band >= 85) return "Toasty out. Keep it short, shady, and bring water.";
-  if (band >= 73) return "Warm one — bring water and take the shady side.";
-  if (t >= 50)    return "Good walk weather. Enjoy it!";
-  if (t >= 35)    return "Cool and fresh — nice for a brisk stroll.";
-  if (t >= 21)    return "Chilly today. A shorter walk, and keep your pup snug.";
-  return "Cold out — make sure your pup stays cozy, and keep it quick.";
-}
-function walkPhraseShort(t, humidity) {
-  if (t == null) return "—";
-  let band = t;
-  if (t >= 70 && humidity != null && (t + humidity) >= 150) band = t + 6;
-  if (band >= 90) return "Too warm · wait for a cooler hour";
-  let verdict;
-  if (band >= 85)      verdict = "Hot";
-  else if (band >= 73) verdict = "Warm";
-  else if (t >= 50)    verdict = "Good walk weather";
-  else if (t >= 35)    verdict = "Cool · nice for a stroll";
-  else if (t >= 21)    verdict = "Chilly · keep it short";
-  else                 verdict = "Cold · keep pup cozy";
-  const tags = [verdict];
-  if (t >= 72) tags.push("Bring water");
-  return tags.join(" · ");
+  if (band >= 90) return { emoji: "🌡️", line: "Too hot · wait for cooler hour" };
+  if (band >= 85) return { emoji: "☀️", line: "Hot · short walk + water" };
+  if (band >= 72) return { emoji: "💧", line: "Warm · bring water" };
+  if (t >= 50)    return { emoji: "🐾", line: "Perfect walk weather" };
+  if (t >= 35)    return { emoji: "🍂", line: "Cool · nice for a stroll" };
+  if (t >= 21)    return { emoji: "🧣", line: "Cold · make it quick" };
+  return { emoji: "🥶", line: "Brrr · keep pup cozy" };
 }
 
 // ---- city search: free fallback geocoder (Open-Meteo), used only when no Google key ----
@@ -199,7 +197,7 @@ function selectCity(c) {
   current = { name: [c.name, c.admin1].filter(Boolean).join(", "), lat: c.latitude, lon: c.longitude };
   cityEl.value = current.name;
   hideSuggest();
-  resetAndLoad(); // new city → fresh log
+  switchCity();
 }
 
 // ---- Google Places (used when GOOGLE_MAPS_API_KEY is set; gives proper addresses) ----
@@ -213,7 +211,7 @@ window.initGooglePlaces = function () {
     const p = ac.getPlace();
     if (!p.geometry) return;
     current = { name: p.formatted_address || p.name, lat: p.geometry.location.lat(), lon: p.geometry.location.lng() };
-    resetAndLoad();
+    switchCity();
   });
 };
 function loadGooglePlaces() {
@@ -259,8 +257,8 @@ function renderData(d) {
   clearTimeout(sniffTimer);
   resultEl.innerHTML = `
     <div class="mb-4 pb-4 border-b border-slate-100">
-      <p class="text-[11px] uppercase tracking-wide text-slate-400 mb-1">Home-screen row (short)</p>
-      <p class="brand font-semibold text-[15px]">☀ ${d.temp}°F · ${esc(d.short_phrase)}</p>
+      <p class="text-[11px] uppercase tracking-wide text-slate-400 mb-1">Home-screen row</p>
+      <p class="brand font-semibold text-[15px]">${d.emoji} ${d.temp}°F · ${esc(d.line)}</p>
     </div>
     <div class="flex items-start justify-between">
       <div>
@@ -269,7 +267,6 @@ function renderData(d) {
       </div>
       <p class="text-sm font-medium text-slate-700 text-right">${esc(d.short)}</p>
     </div>
-    <p class="accent font-semibold mt-3 text-[15px]">${esc(d.phrase)}</p>
     <dl class="grid grid-cols-3 gap-3 mt-5 text-center">
       <div class="bg-slate-50 rounded-xl py-2.5"><dt class="text-[11px] uppercase tracking-wide text-slate-400">Humidity</dt><dd class="text-lg font-semibold text-slate-700">${d.humidity == null ? "–" : d.humidity + "%"}</dd></div>
       <div class="bg-slate-50 rounded-xl py-2.5"><dt class="text-[11px] uppercase tracking-wide text-slate-400">Wind</dt><dd class="text-lg font-semibold text-slate-700">${d.wind == null ? "–" : d.wind}<span class="text-xs"> mph</span></dd></div>
@@ -278,21 +275,22 @@ function renderData(d) {
     <p class="text-[11px] text-slate-400 mt-4">Approximate, for your area · Updated ${esc(fmtUpdated(d.updated))}</p>`;
 }
 
-// ---- timeline log ----
+// ---- history log (Date, then time · reading · city) ----
 function dateKey(d){ return `${d.toLocaleDateString("en-US",{weekday:"short"})} ${d.getDate()}`; }
 function timeFmt(d){ return d.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"}).toLowerCase().replace(" ",""); }
 function renderLog() {
   if (!logEntries.length) {
-    logEl.innerHTML = `<p class="text-xs text-slate-400">Readings will appear here, one every 5 minutes.</p>`;
+    logEl.innerHTML = `<p class="text-xs text-slate-400">Readings will appear here, one every 30 minutes.</p>`;
     return;
   }
   let html = "", lastDate = "";
   logEntries.forEach(e => {
     const dk = dateKey(e.t);
     if (dk !== lastDate) { html += `<p class="brand font-bold text-sm mt-2 mb-1">${dk}</p>`; lastDate = dk; }
+    const place = e.place ? ` <span class="text-slate-400">· ${esc(e.place)}</span>` : "";
     html += `<div class="flex gap-3 py-1">
       <span class="text-slate-400 tabular-nums w-16 shrink-0">${timeFmt(e.t)}</span>
-      <span class="text-slate-700">${esc(e.text)}</span>
+      <span class="text-slate-700">${esc(e.text)}${place}</span>
     </div>`;
   });
   logEl.innerHTML = html;
@@ -321,19 +319,21 @@ async function load() {
     const wind = parseInt(String(now.windSpeed).split(" ")[0]) || null;
     const precip = (now.probabilityOfPrecipitation && now.probabilityOfPrecipitation.value) || 0;
     const humidity = (now.relativeHumidity && now.relativeHumidity.value);
-    const shortPhrase = walkPhraseShort(temp, humidity);
+    const w = walkWeather(temp, humidity);
 
+    setApi(true);
     renderData({
       place: current.name, temp, short: now.shortForecast, wind, precip,
       humidity: humidity == null ? null : humidity,
       updated: h.properties.updateTime || h.properties.generatedAt,
-      phrase: walkPhrase(temp, humidity), short_phrase: shortPhrase,
+      emoji: w.emoji, line: w.line,
     });
 
-    logEntries.push({ t: new Date(), text: `${temp}°F · ${shortPhrase}` });
+    logEntries.push({ t: new Date(), text: `${w.emoji} ${temp}°F · ${w.line}`, place: current.name });
     saveLog();
     renderLog();
   } catch (e) {
+    setApi(false);
     renderError(e.message || "Network error - NWS may be down.");
   }
 }
@@ -341,15 +341,14 @@ function startPolling() {
   clearInterval(pollTimer);
   pollTimer = setInterval(load, POLL_MS);
 }
-function resetAndLoad() {
-  logEntries = [];
-  saveCity(); saveLog();
-  renderLog();
+function switchCity() {
+  // keep the history (each row is tagged with its city); just refresh for the new one
+  saveCity();
   startPolling();
   load();
 }
 
-// manual refresh also logs a reading (no need to wait for the timer)
+// manual refresh also logs a reading
 btnEl.addEventListener("click", load);
 
 // ---- app start (after the gate) ----
@@ -360,7 +359,7 @@ function startApp() {
   if (GOOGLE_MAPS_API_KEY) loadGooglePlaces(); else bindFreeGeocoder();
   saveCity();
   startPolling();
-  load(); // append a fresh reading to the restored history
+  load();
 }
 
 // ---- password gate (soft, client-side) ----
