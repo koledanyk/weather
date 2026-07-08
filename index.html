@@ -36,7 +36,7 @@
   <main class="w-full max-w-md">
     <header class="mb-5">
       <h1 class="text-2xl font-bold brand">lovepup+ weather</h1>
-      <p class="text-sm text-slate-500">Live from the US National Weather Service · US cities · updates every 15 min</p>
+      <p class="text-sm text-slate-500">Live from the US National Weather Service · US cities · updates every 5 min</p>
     </header>
 
     <!-- City search -->
@@ -76,7 +76,7 @@ const gridCache = {};       // NWS grid URL per "lat,lon" (never changes)
 let sniffTimer = null;      // delayed Ginger loading line
 let pollTimer = null;       // 15-min auto-update
 let logEntries = [];        // [{ t: Date, text: string }]
-const POLL_MS = 15 * 60 * 1000;
+const POLL_MS = 5 * 60 * 1000;
 
 const cityEl = document.getElementById("city");
 const btnEl = document.getElementById("refresh");
@@ -254,7 +254,7 @@ function timeFmt(d){ return d.toLocaleTimeString("en-US",{hour:"numeric",minute:
 
 function renderLog() {
   if (!logEntries.length) {
-    logEl.innerHTML = `<p class="text-xs text-slate-400">Readings will appear here, one every 15 minutes.</p>`;
+    logEl.innerHTML = `<p class="text-xs text-slate-400">Readings will appear here, one every 5 minutes.</p>`;
     return;
   }
   let html = "", lastDate = "";
