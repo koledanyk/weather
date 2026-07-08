@@ -13,9 +13,12 @@
   A Google Maps key needs a billing account, and in a static file like this the key
   is visible in the page - restrict it by HTTP referrer + API in Google Cloud.
 
+  Password gate: a soft, client-side gate only. The password lives in the page source,
+  so anyone technical can read or bypass it. It keeps casual visitors out, nothing more.
+  For real access control, put Cloudflare Access in front of the domain.
+
   User-Agent note: NWS wants a User-Agent identifying the app. Browsers can't set that
-  header from JS, so this page relies on the browser's own User-Agent (NWS accepts it
-  because it is non-empty). A real backend must set an explicit app User-Agent.
+  header from JS, so this page relies on the browser's own User-Agent.
 
   This is a functional test, not a design prototype. Tailwind via CDN.
 -->
@@ -33,6 +36,19 @@
 </style>
 </head>
 <body class="min-h-screen flex items-start justify-center p-4 sm:p-8 text-slate-800">
+
+  <!-- Password gate (soft, client-side) -->
+  <div id="gate" class="fixed inset-0 z-50 flex items-center justify-center p-6" style="background:#f4f1ea">
+    <div class="bg-white rounded-2xl card p-6 w-full max-w-xs text-center">
+      <h1 class="text-xl font-bold brand mb-1">lovepup+ weather</h1>
+      <p class="text-sm text-slate-500 mb-4">Enter the password to continue.</p>
+      <input id="pw" type="password" placeholder="Password" autocomplete="current-password"
+        class="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm text-center focus:outline-none focus:ring-2 focus:ring-[#e0556e]/40 focus:border-[#e0556e] mb-2" />
+      <p id="pwerr" class="text-xs accent mb-2 hidden">Wrong password.</p>
+      <button id="pwbtn" class="accent-bg text-white rounded-xl w-full py-2.5 text-sm font-semibold">Enter</button>
+    </div>
+  </div>
+
   <main class="w-full max-w-md">
     <header class="mb-5">
       <h1 class="text-2xl font-bold brand">lovepup+ weather</h1>
@@ -51,8 +67,8 @@
       </div>
       <ul id="suggest" class="hidden absolute left-4 right-4 top-[76px] z-10 bg-white rounded-xl border border-slate-200 shadow-lg overflow-hidden"></ul>
 
-      <!-- Log lives under the selector -->
-      <div id="log" class="mt-4 pt-3 border-t border-slate-100 text-sm"></div>
+      <!-- Timeline log under the selector -->
+      <div id="log" class="mt-4 pt-3 border-t border-slate-100 text-sm max-h-72 overflow-y-auto"></div>
     </div>
 
     <!-- Current weather card -->
@@ -65,19 +81,27 @@
   </main>
 
 <script>
-// ---- state ----
+// ---- config ----
+const PASSWORD = "lovepup+2026!";          // soft gate only - visible in source
 const DEFAULT = { name: "Austin, Texas", lat: 30.2672, lon: -97.7431 }; // Texas default
-let current = { ...DEFAULT };
 // Paste your Google Maps key here for Google Places (proper addresses).
 // Leave empty to use the free Open-Meteo geocoder instead. The key is visible in
 // this file, so restrict it by HTTP referrer + API in Google Cloud before real use.
 const GOOGLE_MAPS_API_KEY = "";
-const gridCache = {};       // NWS grid URL per "lat,lon" (never changes)
-let sniffTimer = null;      // delayed Ginger loading line
-let pollTimer = null;       // 15-min auto-update
-let logEntries = [];        // [{ t: Date, text: string }]
-const POLL_MS = 5 * 60 * 1000;
+const POLL_MS = 5 * 60 * 1000;             // collect a reading every 5 minutes
+const LS_AUTH = "weather_auth", LS_CITY = "weather_city", LS_LOG = "weather_log";
 
+// ---- state ----
+let current = { ...DEFAULT };
+const gridCache = {};
+let sniffTimer = null;
+let pollTimer = null;
+let logEntries = [];                       // [{ t: Date, text }]
+
+const gateEl = document.getElementById("gate");
+const pwEl = document.getElementById("pw");
+const pwBtn = document.getElementById("pwbtn");
+const pwErr = document.getElementById("pwerr");
 const cityEl = document.getElementById("city");
 const btnEl = document.getElementById("refresh");
 const suggestEl = document.getElementById("suggest");
@@ -85,6 +109,23 @@ const resultEl = document.getElementById("result");
 const logEl = document.getElementById("log");
 
 function esc(s){ return String(s).replace(/[&<>]/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[m])); }
+
+// ---- localStorage persistence (data collection is continuous + survives reloads) ----
+function saveCity(){ try { localStorage.setItem(LS_CITY, JSON.stringify(current)); } catch {} }
+function saveLog(){
+  try {
+    const slim = logEntries.slice(-200).map(e => ({ t: e.t.toISOString(), text: e.text }));
+    localStorage.setItem(LS_LOG, JSON.stringify(slim));
+  } catch {}
+}
+function loadPersisted(){
+  try {
+    const c = JSON.parse(localStorage.getItem(LS_CITY) || "null");
+    if (c && c.lat != null) current = c;
+    const l = JSON.parse(localStorage.getItem(LS_LOG) || "[]");
+    logEntries = l.map(e => ({ t: new Date(e.t), text: e.text }));
+  } catch {}
+}
 
 // ---- walk-weather logic (same ranges as the ticket) ----
 function walkPhrase(t, humidity) {
@@ -119,23 +160,22 @@ function walkPhraseShort(t, humidity) {
 // ---- city search: free fallback geocoder (Open-Meteo), used only when no Google key ----
 let debounce = null;
 function bindFreeGeocoder() {
-cityEl.addEventListener("input", () => {
-  clearTimeout(debounce);
-  const q = cityEl.value.trim();
-  if (q.length < 2) return hideSuggest();
-  debounce = setTimeout(() => searchCity(q), 250);
-});
-cityEl.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") {
-    const first = suggestEl.querySelector("li[data-i]");
-    if (first) first.click();
-  }
-});
-document.addEventListener("click", (e) => {
-  if (!suggestEl.contains(e.target) && e.target !== cityEl) hideSuggest();
-});
-} // end bindFreeGeocoder
-
+  cityEl.addEventListener("input", () => {
+    clearTimeout(debounce);
+    const q = cityEl.value.trim();
+    if (q.length < 2) return hideSuggest();
+    debounce = setTimeout(() => searchCity(q), 250);
+  });
+  cityEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      const first = suggestEl.querySelector("li[data-i]");
+      if (first) first.click();
+    }
+  });
+  document.addEventListener("click", (e) => {
+    if (!suggestEl.contains(e.target) && e.target !== cityEl) hideSuggest();
+  });
+}
 async function searchCity(q) {
   try {
     const r = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(q)}&count=8&language=en&format=json`);
@@ -151,21 +191,15 @@ function showSuggest(list) {
        <span class="font-medium text-slate-700">${esc(c.name)}</span>
        <span class="text-slate-400">, ${esc(c.admin1 || "")}</span>
      </li>`).join("");
-  Array.from(suggestEl.children).forEach((li, i) => {
-    li.addEventListener("click", () => selectCity(list[i]));
-  });
+  Array.from(suggestEl.children).forEach((li, i) => li.addEventListener("click", () => selectCity(list[i])));
   suggestEl.classList.remove("hidden");
 }
 function hideSuggest() { suggestEl.classList.add("hidden"); suggestEl.innerHTML = ""; }
-
 function selectCity(c) {
-  current = {
-    name: [c.name, c.admin1].filter(Boolean).join(", "),
-    lat: c.latitude, lon: c.longitude,
-  };
+  current = { name: [c.name, c.admin1].filter(Boolean).join(", "), lat: c.latitude, lon: c.longitude };
   cityEl.value = current.name;
   hideSuggest();
-  resetAndLoad(); // new city → fresh log + restart the 15-min clock
+  resetAndLoad(); // new city → fresh log
 }
 
 // ---- Google Places (used when GOOGLE_MAPS_API_KEY is set; gives proper addresses) ----
@@ -177,12 +211,8 @@ window.initGooglePlaces = function () {
   });
   ac.addListener("place_changed", () => {
     const p = ac.getPlace();
-    if (!p.geometry) return; // typed text but no suggestion picked
-    current = {
-      name: p.formatted_address || p.name,
-      lat: p.geometry.location.lat(),
-      lon: p.geometry.location.lng(),
-    };
+    if (!p.geometry) return;
+    current = { name: p.formatted_address || p.name, lat: p.geometry.location.lat(), lon: p.geometry.location.lng() };
     resetAndLoad();
   });
 };
@@ -190,7 +220,7 @@ function loadGooglePlaces() {
   const s = document.createElement("script");
   s.src = `https://maps.googleapis.com/maps/api/js?key=${GOOGLE_MAPS_API_KEY}&libraries=places&callback=initGooglePlaces`;
   s.async = true;
-  s.onerror = bindFreeGeocoder; // if the key fails to load, fall back
+  s.onerror = bindFreeGeocoder;
   document.head.appendChild(s);
 }
 
@@ -248,10 +278,9 @@ function renderData(d) {
     <p class="text-[11px] text-slate-400 mt-4">Approximate, for your area · Updated ${esc(fmtUpdated(d.updated))}</p>`;
 }
 
-// ---- log under the selector ----
+// ---- timeline log ----
 function dateKey(d){ return `${d.toLocaleDateString("en-US",{weekday:"short"})} ${d.getDate()}`; }
 function timeFmt(d){ return d.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"}).toLowerCase().replace(" ",""); }
-
 function renderLog() {
   if (!logEntries.length) {
     logEl.innerHTML = `<p class="text-xs text-slate-400">Readings will appear here, one every 5 minutes.</p>`;
@@ -260,10 +289,7 @@ function renderLog() {
   let html = "", lastDate = "";
   logEntries.forEach(e => {
     const dk = dateKey(e.t);
-    if (dk !== lastDate) {
-      html += `<p class="brand font-bold text-sm mt-2 mb-1">${dk}</p>`;
-      lastDate = dk;
-    }
+    if (dk !== lastDate) { html += `<p class="brand font-bold text-sm mt-2 mb-1">${dk}</p>`; lastDate = dk; }
     html += `<div class="flex gap-3 py-1">
       <span class="text-slate-400 tabular-nums w-16 shrink-0">${timeFmt(e.t)}</span>
       <span class="text-slate-700">${esc(e.text)}</span>
@@ -298,38 +324,56 @@ async function load() {
     const shortPhrase = walkPhraseShort(temp, humidity);
 
     renderData({
-      place: current.name,
-      temp, short: now.shortForecast, wind, precip,
+      place: current.name, temp, short: now.shortForecast, wind, precip,
       humidity: humidity == null ? null : humidity,
       updated: h.properties.updateTime || h.properties.generatedAt,
-      phrase: walkPhrase(temp, humidity),
-      short_phrase: shortPhrase,
+      phrase: walkPhrase(temp, humidity), short_phrase: shortPhrase,
     });
 
-    // append to the timeline log
     logEntries.push({ t: new Date(), text: `${temp}°F · ${shortPhrase}` });
+    saveLog();
     renderLog();
   } catch (e) {
     renderError(e.message || "Network error - NWS may be down.");
   }
 }
-
+function startPolling() {
+  clearInterval(pollTimer);
+  pollTimer = setInterval(load, POLL_MS);
+}
 function resetAndLoad() {
   logEntries = [];
+  saveCity(); saveLog();
   renderLog();
-  clearInterval(pollTimer);
-  pollTimer = setInterval(load, POLL_MS); // auto-update every 15 min
+  startPolling();
   load();
 }
 
-// manual refresh also logs a reading (so you don't have to wait 15 min to see it work)
+// manual refresh also logs a reading (no need to wait for the timer)
 btnEl.addEventListener("click", load);
 
-// ---- init ----
-cityEl.value = current.name;
-renderLog();
-if (GOOGLE_MAPS_API_KEY) loadGooglePlaces(); else bindFreeGeocoder();
-resetAndLoad();
+// ---- app start (after the gate) ----
+function startApp() {
+  loadPersisted();
+  cityEl.value = current.name;
+  renderLog();
+  if (GOOGLE_MAPS_API_KEY) loadGooglePlaces(); else bindFreeGeocoder();
+  saveCity();
+  startPolling();
+  load(); // append a fresh reading to the restored history
+}
+
+// ---- password gate (soft, client-side) ----
+function unlock() { gateEl.classList.add("hidden"); startApp(); }
+function tryPw() {
+  if (pwEl.value === PASSWORD) { try { localStorage.setItem(LS_AUTH, "ok"); } catch {} unlock(); }
+  else { pwErr.classList.remove("hidden"); pwEl.select(); }
+}
+pwBtn.addEventListener("click", tryPw);
+pwEl.addEventListener("keydown", (e) => { if (e.key === "Enter") tryPw(); });
+
+if (localStorage.getItem(LS_AUTH) === "ok") unlock();
+else pwEl.focus();
 </script>
 </body>
 </html>
