@@ -51,7 +51,7 @@
   <main class="w-full max-w-2xl">
     <header class="mb-5">
       <h1 class="text-2xl font-bold brand">lovepup+ weather</h1>
-      <p class="text-sm text-slate-500">Live from the US National Weather Service · US cities · updates every 30 min</p>
+      <p class="text-sm text-slate-500">Live from the US National Weather Service · US cities · updates every 5 min</p>
       <div class="flex items-center gap-1.5 text-xs text-slate-500 mt-2">
         <span id="apidot" class="inline-block w-2 h-2 rounded-full" style="background:#cbd5e1"></span>
         <span id="apitext">Checking NWS…</span>
@@ -94,7 +94,7 @@ const DEFAULT = { name: "Austin, Texas", lat: 30.2672, lon: -97.7431 }; // Texas
 // Leave empty to use the free Open-Meteo geocoder instead. The key is visible in
 // this file, so restrict it by HTTP referrer + API in Google Cloud before real use.
 const GOOGLE_MAPS_API_KEY = "";
-const POLL_MS = 30 * 60 * 1000;            // auto-update every 30 minutes
+const POLL_MS = 5 * 60 * 1000;             // auto-update every 5 minutes
 const LS_AUTH = "weather_auth", LS_CITY = "weather_city", LS_LOG = "weather_log";
 
 // ---- state ----
@@ -137,6 +137,26 @@ function loadPersisted(){
     if (c && c.lat != null) current = c;
     const l = JSON.parse(localStorage.getItem(LS_LOG) || "[]");
     logEntries = l.map(e => ({ t: new Date(e.t), text: e.text, place: e.place }));
+  } catch {}
+}
+
+// ---- central history (D1-backed via the Node server); localStorage stays a fallback ----
+async function fetchServerHistory(){
+  try {
+    const r = await fetch("/api/history");
+    if (!r.ok) return null;
+    const rows = await r.json();
+    if (!Array.isArray(rows)) return null;
+    return rows.map(e => ({ t: new Date(e.ts || e.t), text: e.text, place: e.place }));
+  } catch { return null; }
+}
+function postServerLog(entry){
+  try {
+    fetch("/api/log", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ t: entry.t.toISOString(), text: entry.text, place: entry.place }),
+    }).catch(() => {});
   } catch {}
 }
 
@@ -280,7 +300,7 @@ function dateKey(d){ return `${d.toLocaleDateString("en-US",{weekday:"short"})} 
 function timeFmt(d){ return d.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"}).toLowerCase().replace(" ",""); }
 function renderLog() {
   if (!logEntries.length) {
-    logEl.innerHTML = `<p class="text-xs text-slate-400">Readings will appear here, one every 30 minutes.</p>`;
+    logEl.innerHTML = `<p class="text-xs text-slate-400">Readings will appear here, one every 5 minutes.</p>`;
     return;
   }
   logEntries.sort((a, b) => a.t - b.t); // oldest first (7, 8, 9, 10 ...)
@@ -330,14 +350,18 @@ async function load() {
       emoji: w.emoji, line: w.line,
     });
 
-    logEntries.push({ t: new Date(), text: `${w.emoji} ${temp}°F · ${w.line}`, place: current.name });
+    const entry = { t: new Date(), text: `${w.emoji} ${temp}°F · ${w.line}`, place: current.name };
+    logEntries.push(entry);
     saveLog();
+    postServerLog(entry);
     renderLog();
   } catch (e) {
     setApi(false);
     renderError(e.message || "Network error - NWS may be down.");
-    logEntries.push({ t: new Date(), text: "No weather nearby. On Pluto? 🛰️", place: current.name });
+    const entry = { t: new Date(), text: "No weather nearby. On Pluto? 🛰️", place: current.name };
+    logEntries.push(entry);
     saveLog();
+    postServerLog(entry);
     renderLog();
   }
 }
@@ -356,8 +380,10 @@ function switchCity() {
 btnEl.addEventListener("click", load);
 
 // ---- app start (after the gate) ----
-function startApp() {
-  loadPersisted();
+async function startApp() {
+  loadPersisted();                       // current city + local cache
+  const server = await fetchServerHistory();
+  if (server) logEntries = server;       // prefer central history when available
   cityEl.value = current.name;
   renderLog();
   if (GOOGLE_MAPS_API_KEY) loadGooglePlaces(); else bindFreeGeocoder();
