@@ -160,6 +160,28 @@ function postServerLog(entry){
   } catch {}
 }
 
+// ---- cross-check NWS against Open-Meteo (independent free source, no key) ----
+async function fetchOpenMeteo(lat, lon){
+  const r = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m&temperature_unit=fahrenheit`);
+  if (!r.ok) throw new Error("open-meteo " + r.status);
+  const c = (await r.json()).current || {};
+  return { temp: Math.round(c.temperature_2m), humidity: c.relative_humidity_2m };
+}
+async function updateCrossCheck(nwsTemp){
+  const el = document.getElementById("crosscheck");
+  if (!el) return;
+  try {
+    const om = await fetchOpenMeteo(current.lat, current.lon);
+    const d = Math.abs(nwsTemp - om.temp);
+    let color = "#22c55e", label = "match";       // < 5F: normal
+    if (d >= 10) { color = "#e0556e"; label = "mismatch — check"; }   // problem
+    else if (d >= 5) { color = "#f59e0b"; label = "small gap"; }      // watch
+    el.innerHTML = `<span style="color:${color}">●</span> Cross-check · NWS ${nwsTemp}°F vs Open-Meteo ${om.temp}°F · Δ${d}°F · ${label}`;
+  } catch {
+    el.innerHTML = `<span class="text-slate-400">Cross-check unavailable</span>`;
+  }
+}
+
 // ---- walk-weather logic: emoji + line per band (see the ticket table) ----
 // High humidity bumps one band warmer (heat-index rule: temp°F + humidity% >= 150).
 function walkWeather(t, humidity) {
@@ -292,7 +314,8 @@ function renderData(d) {
       <div class="bg-slate-50 rounded-xl py-2.5"><dt class="text-[11px] uppercase tracking-wide text-slate-400">Wind</dt><dd class="text-lg font-semibold text-slate-700">${d.wind == null ? "–" : d.wind}<span class="text-xs"> mph</span></dd></div>
       <div class="bg-slate-50 rounded-xl py-2.5"><dt class="text-[11px] uppercase tracking-wide text-slate-400">Precip</dt><dd class="text-lg font-semibold text-slate-700">${d.precip}%</dd></div>
     </dl>
-    <p class="text-[11px] text-slate-400 mt-4">Approximate, for your area · Updated ${esc(fmtUpdated(d.updated))}</p>`;
+    <p class="text-[11px] text-slate-400 mt-4">Approximate, for your area · Updated ${esc(fmtUpdated(d.updated))}</p>
+    <p id="crosscheck" class="text-[11px] text-slate-500 mt-1">Cross-check · checking Open-Meteo…</p>`;
 }
 
 // ---- history log (Date, then time · reading · city) ----
@@ -349,6 +372,7 @@ async function load() {
       updated: h.properties.updateTime || h.properties.generatedAt,
       emoji: w.emoji, line: w.line,
     });
+    updateCrossCheck(temp);
 
     const entry = { t: new Date(), text: `${w.emoji} ${temp}°F · ${w.line}`, place: current.name };
     logEntries.push(entry);
