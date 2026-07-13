@@ -14,4 +14,9 @@ WORKDIR /app
 COPY index.html server.js ./
 
 EXPOSE 80
+
+# Container health = the server answers /api/health. Turns Coolify's "unknown" into "healthy".
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:80/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
 CMD ["node", "server.js"]
