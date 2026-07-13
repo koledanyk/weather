@@ -167,19 +167,29 @@ async function fetchOpenMeteo(lat, lon){
   const c = (await r.json()).current || {};
   return { temp: Math.round(c.temperature_2m), humidity: c.relative_humidity_2m };
 }
-async function updateCrossCheck(nwsTemp){
+function renderCrossCheck(nwsTemp, om){
   const el = document.getElementById("crosscheck");
   if (!el) return;
-  try {
-    const om = await fetchOpenMeteo(current.lat, current.lon);
-    const d = Math.abs(nwsTemp - om.temp);
-    let color = "#22c55e", label = "match";       // < 5F: normal
-    if (d >= 10) { color = "#e0556e"; label = "mismatch — check"; }   // problem
-    else if (d >= 5) { color = "#f59e0b"; label = "small gap"; }      // watch
-    el.innerHTML = `<span style="color:${color}">●</span> Cross-check · NWS ${nwsTemp}°F vs Open-Meteo ${om.temp}°F · Δ${d}°F · ${label}`;
-  } catch {
-    el.innerHTML = `<span class="text-slate-400">Cross-check unavailable</span>`;
+  if (!om) { el.innerHTML = `<span style="color:#e0556e">●</span> Cross-check · Open-Meteo down`; return; }
+  if (nwsTemp == null) { el.innerHTML = `<span style="color:#f59e0b">●</span> Cross-check · NWS down · Open-Meteo ${om.temp}°F`; return; }
+  const d = Math.abs(nwsTemp - om.temp);
+  let color = "#22c55e", label = "match";                          // < 5F: normal
+  if (d >= 10) { color = "#e0556e"; label = "mismatch — check"; }   // problem
+  else if (d >= 5) { color = "#f59e0b"; label = "small gap"; }      // watch
+  el.innerHTML = `<span style="color:${color}">●</span> Cross-check · NWS ${nwsTemp}°F vs Open-Meteo ${om.temp}°F · Δ${d}°F · ${label}`;
+}
+// One history line recording BOTH APIs each tick, so failures show up in the log.
+function buildLogText(nws, om){
+  let s = nws ? `${nws.emoji} ${nws.temp}°F · ${nws.line}` : "⚠ NWS down · No weather nearby. On Pluto? 🛰️";
+  if (om && nws) {
+    const d = Math.abs(nws.temp - om.temp);
+    s += ` · OM ${om.temp}°F ${d >= 10 ? "⚠Δ" : "Δ"}${d}`;
+  } else if (om) {
+    s += ` · OM ${om.temp}°F`;
+  } else {
+    s += " · OM down";
   }
+  return s;
 }
 
 // ---- walk-weather logic: emoji + line per band (see the ticket table) ----
@@ -352,6 +362,9 @@ async function nwsGet(url) {
 async function load() {
   const key = `${current.lat.toFixed(4)},${current.lon.toFixed(4)}`;
   renderLoading();
+
+  // Primary source: NWS
+  let nws = null;
   try {
     if (!gridCache[key]) {
       const pt = await nwsGet(`https://api.weather.gov/points/${key}`);
@@ -364,7 +377,7 @@ async function load() {
     const precip = (now.probabilityOfPrecipitation && now.probabilityOfPrecipitation.value) || 0;
     const humidity = (now.relativeHumidity && now.relativeHumidity.value);
     const w = walkWeather(temp, humidity);
-
+    nws = { temp, line: w.line, emoji: w.emoji };
     setApi(true);
     renderData({
       place: current.name, temp, short: now.shortForecast, wind, precip,
@@ -372,22 +385,22 @@ async function load() {
       updated: h.properties.updateTime || h.properties.generatedAt,
       emoji: w.emoji, line: w.line,
     });
-    updateCrossCheck(temp);
-
-    const entry = { t: new Date(), text: `${w.emoji} ${temp}°F · ${w.line}`, place: current.name };
-    logEntries.push(entry);
-    saveLog();
-    postServerLog(entry);
-    renderLog();
   } catch (e) {
     setApi(false);
     renderError(e.message || "Network error - NWS may be down.");
-    const entry = { t: new Date(), text: "No weather nearby. On Pluto? 🛰️", place: current.name };
-    logEntries.push(entry);
-    saveLog();
-    postServerLog(entry);
-    renderLog();
   }
+
+  // Second source to monitor: Open-Meteo (cross-check)
+  let om = null;
+  try { om = await fetchOpenMeteo(current.lat, current.lon); } catch { om = null; }
+  renderCrossCheck(nws ? nws.temp : null, om);
+
+  // One log line capturing both APIs, so a failure of either is visible after the fact
+  const entry = { t: new Date(), text: buildLogText(nws, om), place: current.name };
+  logEntries.push(entry);
+  saveLog();
+  postServerLog(entry);
+  renderLog();
 }
 function startPolling() {
   clearInterval(pollTimer);
